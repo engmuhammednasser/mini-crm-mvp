@@ -1,8 +1,8 @@
 ﻿# =============================================================================
 #  github-upload.ps1
-#  A helper script to upload any project to GitHub easily and safely.
+#  A reusable helper script to upload any project to GitHub easily and safely.
 #  Author : Antigravity AI Assistant
-#  Date   : 2026-05-02
+#  Date   : 2026-05-02  |  v2.0
 # =============================================================================
 
 # ── Pretty helpers ─────────────────────────────────────────────────────────────
@@ -12,11 +12,160 @@ function Write-Warn  { param([string]$msg) Write-Host "  ⚠  $msg" -ForegroundC
 function Write-Fail  { param([string]$msg) Write-Host "`n  ✖  $msg" -ForegroundColor Red }
 function Write-Info  { param([string]$msg) Write-Host "     $msg" -ForegroundColor Gray }
 
+# =============================================================================
+# URL NORMALIZATION FUNCTIONS
+# =============================================================================
+#
+# Is-ValidGitHubRepoInput
+# ───────────────────────
+# Returns $true when the trimmed input matches one of the accepted formats:
+#   • owner/repo  shorthand          e.g.  username/project-name
+#   • HTTPS GitHub URL               e.g.  https://github.com/owner/repo[.git][/]
+#   • SSH  GitHub URL                e.g.  git@github.com:owner/repo[.git]
+#
+# Returns $false for anything else:
+#   • gitlab / bitbucket / other hosts
+#   • random text with no recognised structure
+#   • github.com without the https:// scheme
+#   • accidental double-encoding like https://github.com/git@...
+#
+function Is-ValidGitHubRepoInput {
+    param([string]$raw)
+
+    $s = $raw.Trim().TrimEnd('/')
+
+    # owner/repo  (no slashes other than the one separator, no protocol)
+    if ($s -match '^[A-Za-z0-9_.\-]+/[A-Za-z0-9_.\-]+$') { return $true }
+
+    # HTTPS GitHub URL  – host must be exactly github.com
+    if ($s -match '^https://github\.com/[A-Za-z0-9_.\-]+/[A-Za-z0-9_.\-]+(\.git)?/?$') { return $true }
+
+    # SSH GitHub URL
+    if ($s -match '^git@github\.com:[A-Za-z0-9_.\-]+/[A-Za-z0-9_.\-]+(\.git)?$') { return $true }
+
+    return $false
+}
+
+# =============================================================================
+# Normalize-RepoUrl
+# ─────────────────
+# Accepts every valid GitHub repo format and returns a canonical URL.
+#
+# Normalisation rules applied in order:
+#   1. Trim leading/trailing whitespace.
+#   2. Remove a single trailing slash (browser copy artefact).
+#   3. Detect SSH URL  → keep as-is, append .git if missing.
+#   4. Detect HTTPS URL → keep scheme + path, append .git if missing.
+#   5. Detect owner/repo shorthand → build https://github.com/owner/repo.git
+#   6. Anything else → throw so the caller can ask the user again.
+#
+# Test examples (INPUT → EXPECTED OUTPUT)
+# ─────────────────────────────────────────────────────────────────────────────
+#   username/project-name
+#       → https://github.com/username/project-name.git
+#
+#   https://github.com/username/project-name
+#       → https://github.com/username/project-name.git
+#
+#   https://github.com/username/project-name.git
+#       → https://github.com/username/project-name.git        (unchanged)
+#
+#   https://github.com/username/project-name/
+#       → https://github.com/username/project-name.git        (slash stripped)
+#
+#   git@github.com:username/project-name
+#       → git@github.com:username/project-name.git
+#
+#   git@github.com:username/project-name.git
+#       → git@github.com:username/project-name.git            (unchanged)
+#
+# Invalid inputs (will throw):
+#   https://github.com/git@github.com:username/project-name.git.git
+#   random-text
+#   github.com/username/project-name        (missing https://)
+#   https://gitlab.com/username/project-name
+# =============================================================================
+function Normalize-RepoUrl {
+    param([string]$raw)
+
+    # ── Step 1: trim whitespace and trailing slash ──────────────────────────
+    $s = $raw.Trim().TrimEnd('/')
+
+    # ── Step 2: reject empty input ──────────────────────────────────────────
+    if ([string]::IsNullOrWhiteSpace($s)) {
+        throw "Repository URL cannot be empty."
+    }
+
+    # ── Step 3: SSH GitHub URL  (git@github.com:owner/repo[.git]) ──────────
+    #   Do NOT convert to HTTPS; keep the SSH form exactly as-is.
+    if ($s -match '^git@github\.com:[A-Za-z0-9_.\-]+/[A-Za-z0-9_.\-]+(\.git)?$') {
+        if (-not $s.EndsWith('.git')) { $s += '.git' }
+        return $s
+    }
+
+    # ── Step 4: HTTPS GitHub URL ────────────────────────────────────────────
+    #   Must start with https://github.com/ – reject http://, gitlab, etc.
+    if ($s -match '^https://github\.com/[A-Za-z0-9_.\-]+/[A-Za-z0-9_.\-]+(\.git)?$') {
+        # Strip accidental duplicate .git  (safety guard)
+        $s = $s -replace '\.git\.git$', '.git'
+        if (-not $s.EndsWith('.git')) { $s += '.git' }
+        return $s
+    }
+
+    # ── Step 5: owner/repo shorthand ────────────────────────────────────────
+    #   Exactly one slash, no protocol prefix, no dots in between (only in names)
+    if ($s -match '^[A-Za-z0-9_.\-]+/[A-Za-z0-9_.\-]+$') {
+        return "https://github.com/$s.git"
+    }
+
+    # ── Step 6: nothing matched → unsupported format ────────────────────────
+    throw "Unsupported GitHub repository format: '$raw'"
+}
+
+# =============================================================================
+# Is-MalformedGitHubRemote
+# ────────────────────────
+# Heuristic check applied to an *existing* remote URL that was already stored
+# in the repo's git config.  Returns $true when the URL looks broken.
+#
+# Patterns detected as malformed:
+#   • Ends with .git.git
+#   • Contains git@github.com inside an HTTPS URL  (https://github.com/git@…)
+#   • Has no recognisable owner/repo segment after github.com
+#   • Empty / whitespace only
+# =============================================================================
+function Is-MalformedGitHubRemote {
+    param([string]$url)
+
+    $u = $url.Trim()
+
+    if ([string]::IsNullOrWhiteSpace($u))           { return $true }
+    if ($u -match '\.git\.git')                     { return $true }
+    if ($u -match 'github\.com/git@')               { return $true }
+    if ($u -match 'github\.com/@')                  { return $true }
+
+    # HTTPS URL must have owner/repo after github.com/
+    if ($u -match '^https://') {
+        if ($u -notmatch '^https://github\.com/[A-Za-z0-9_.\-]+/[A-Za-z0-9_.\-]+(\.git)?/?$') {
+            return $true
+        }
+    }
+
+    # SSH URL must have owner/repo after the colon
+    if ($u -match '^git@') {
+        if ($u -notmatch '^git@github\.com:[A-Za-z0-9_.\-]+/[A-Za-z0-9_.\-]+(\.git)?$') {
+            return $true
+        }
+    }
+
+    return $false
+}
+
 # ── Banner ─────────────────────────────────────────────────────────────────────
 Clear-Host
 Write-Host ""
 Write-Host "  ╔══════════════════════════════════════════════╗" -ForegroundColor Magenta
-Write-Host "  ║        GitHub Upload Script  v1.0            ║" -ForegroundColor Magenta
+Write-Host "  ║        GitHub Upload Script  v2.0            ║" -ForegroundColor Magenta
 Write-Host "  ║   Easily push any project to GitHub          ║" -ForegroundColor Magenta
 Write-Host "  ╚══════════════════════════════════════════════╝" -ForegroundColor Magenta
 Write-Host ""
@@ -29,13 +178,11 @@ $defaultPath = (Get-Location).Path
 $inputPath   = Read-Host "  Enter project path (press Enter for current folder: $defaultPath)"
 $projectPath = if ([string]::IsNullOrWhiteSpace($inputPath)) { $defaultPath } else { $inputPath.Trim() }
 
-# Validate that the folder exists
 if (-not (Test-Path $projectPath -PathType Container)) {
     Write-Fail "Folder not found: $projectPath"
     exit 1
 }
 
-# Change into the project directory for all subsequent git commands
 Set-Location $projectPath
 Write-OK "Working in: $projectPath"
 
@@ -69,8 +216,6 @@ if (-not (Test-Path ".git" -PathType Container)) {
 # =============================================================================
 Write-Step "Updating .gitignore"
 
-# These are the patterns we ALWAYS want to ignore.
-# They are grouped for readability inside the file.
 $ignoreBlocks = @"
 # ── Environment & secrets ───────────────────────────────────────────────
 .env
@@ -116,13 +261,11 @@ Desktop.ini
 $gitignorePath = ".gitignore"
 
 if (Test-Path $gitignorePath) {
-    # File exists – add only the lines that are not already present
     $existing = Get-Content $gitignorePath -Raw
     $newLines  = @()
 
     foreach ($line in ($ignoreBlocks -split "`n")) {
         $trimmed = $line.Trim()
-        # Skip blank lines and comment-only lines when checking for duplicates
         if ($trimmed -eq "" -or $trimmed.StartsWith("#")) {
             $newLines += $line
             continue
@@ -133,13 +276,12 @@ if (Test-Path $gitignorePath) {
     }
 
     if ($newLines.Count -gt 0) {
-        Add-Content $gitignorePath ("`n# ── Added by github-upload.ps1 ──────────────────────────────────────────`n" + ($newLines -join "`n"))
+        Add-Content $gitignorePath ("`n# ── Added by github-upload.ps1 ────────────────────────────────────────`n" + ($newLines -join "`n"))
         Write-OK ".gitignore updated with missing entries."
     } else {
         Write-OK ".gitignore already contains all required entries."
     }
 } else {
-    # No .gitignore yet – create a fresh one
     Set-Content $gitignorePath $ignoreBlocks -Encoding UTF8
     Write-OK ".gitignore created."
 }
@@ -173,7 +315,6 @@ if ([string]::IsNullOrWhiteSpace($currentEmail)) {
 # =============================================================================
 Write-Step "Removing sensitive files from tracking (if previously committed)"
 
-# Patterns that must never be committed
 $sensitivePatterns = @(
     ".env",
     "wp-config.php",
@@ -182,7 +323,6 @@ $sensitivePatterns = @(
 )
 
 foreach ($pattern in $sensitivePatterns) {
-    # --cached means: stop tracking the file/folder but KEEP it on disk
     $result = git rm -r --cached --ignore-unmatch $pattern 2>&1
     if ($result -match "rm '") {
         Write-Warn "Removed from tracking: $pattern  (file kept locally)"
@@ -190,22 +330,91 @@ foreach ($pattern in $sensitivePatterns) {
 }
 
 # =============================================================================
-# STEP 7 – GitHub repository URL
+# STEP 7 – GitHub repository URL  (robust, generic, validated)
 # =============================================================================
 Write-Step "GitHub repository"
-$repoInput = Read-Host "  Enter GitHub repo URL or owner/repo (e.g. johndoe/my-project)"
-$repoInput  = $repoInput.Trim()
 
-# Convert owner/repo shorthand to full HTTPS URL
-if ($repoInput -notmatch "^https?://") {
-    $repoUrl = "https://github.com/$repoInput.git"
-    Write-Info "Converted to: $repoUrl"
-} else {
-    # Ensure the URL ends with .git
-    $repoUrl = if ($repoInput.EndsWith(".git")) { $repoInput } else { "$repoInput.git" }
+# ── Helper: print accepted formats ─────────────────────────────────────────
+function Show-AcceptedFormats {
+    Write-Host ""
+    Write-Info "  Accepted formats:"
+    Write-Info "    • username/project-name"
+    Write-Info "    • https://github.com/username/project-name.git"
+    Write-Info "    • https://github.com/username/project-name"
+    Write-Info "    • https://github.com/username/project-name/"
+    Write-Info "    • git@github.com:username/project-name.git"
+    Write-Info "    • git@github.com:username/project-name"
+    Write-Host ""
 }
 
-Write-OK "Repository URL: $repoUrl"
+# ── Check for an existing remote origin ────────────────────────────────────
+$remotes    = git remote 2>&1
+$repoUrl    = $null
+$skipPrompt = $false
+
+if ($remotes -contains "origin") {
+    $existingOrigin = (git remote get-url origin 2>&1).Trim()
+    Write-Info "Existing remote origin: $existingOrigin"
+
+    if (Is-MalformedGitHubRemote $existingOrigin) {
+        # ── Repair flow ──────────────────────────────────────────────────────
+        Write-Host ""
+        Write-Warn "The current remote origin looks malformed or invalid:"
+        Write-Info "  $existingOrigin"
+        Write-Warn "Please enter a valid GitHub repository URL to replace it."
+        Show-AcceptedFormats
+    } else {
+        # ── Valid existing origin – ask to keep or replace ────────────────────
+        Write-Host ""
+        Write-OK "Remote origin is valid: $existingOrigin"
+        $keepChoice = Read-Host "  Keep this remote? (Y / N)"
+        if ($keepChoice -match '^[Yy]') {
+            $repoUrl    = $existingOrigin
+            $skipPrompt = $true
+            Write-OK "Keeping existing remote: $repoUrl"
+        } else {
+            Write-Info "You chose to replace the remote. Enter the new URL:"
+            Show-AcceptedFormats
+        }
+    }
+} else {
+    Show-AcceptedFormats
+}
+
+# ── Input loop – keep asking until a valid URL is entered ──────────────────
+if (-not $skipPrompt) {
+    while ($true) {
+        $rawInput = Read-Host "  Enter GitHub repo URL or owner/repo"
+
+        if ([string]::IsNullOrWhiteSpace($rawInput)) {
+            Write-Fail "Input cannot be empty."
+            Show-AcceptedFormats
+            continue
+        }
+
+        if (-not (Is-ValidGitHubRepoInput $rawInput)) {
+            Write-Fail "Unrecognised format: '$($rawInput.Trim())'"
+            Write-Info "Only github.com repositories are supported."
+            Show-AcceptedFormats
+            continue
+        }
+
+        try {
+            $repoUrl = Normalize-RepoUrl $rawInput
+            break   # Valid – exit the loop
+        } catch {
+            Write-Fail $_.Exception.Message
+            Show-AcceptedFormats
+        }
+    }
+}
+
+# ── Preview the normalised URL ─────────────────────────────────────────────
+Write-Host ""
+Write-Host "  Repository URL accepted:" -ForegroundColor Cyan
+Write-Host "  $repoUrl" -ForegroundColor White
+Write-Host ""
+Write-OK "URL normalised successfully."
 
 # =============================================================================
 # STEP 8 – Add or update remote 'origin'
@@ -215,10 +424,10 @@ Write-Step "Configuring remote origin"
 $remotes = git remote 2>&1
 if ($remotes -contains "origin") {
     git remote set-url origin $repoUrl | Out-Null
-    Write-OK "Remote 'origin' updated."
+    Write-OK "Remote 'origin' updated to: $repoUrl"
 } else {
     git remote add origin $repoUrl | Out-Null
-    Write-OK "Remote 'origin' added."
+    Write-OK "Remote 'origin' added: $repoUrl"
 }
 
 # =============================================================================
@@ -250,7 +459,6 @@ Write-OK "All files staged."
 Write-Step "Committing"
 $commitOutput = git commit -m $commitMessage 2>&1
 
-# Handle the case where there is nothing new to commit
 if ($commitOutput -match "nothing to commit") {
     Write-Warn "Nothing new to commit. The working tree is clean."
 } elseif ($LASTEXITCODE -ne 0) {
@@ -261,7 +469,7 @@ if ($commitOutput -match "nothing to commit") {
 }
 
 # =============================================================================
-# STEP 13 – Rename/create branch
+# STEP 13 – Rename / create branch
 # =============================================================================
 Write-Step "Setting branch to '$branch'"
 git branch -M $branch 2>&1 | Out-Null
