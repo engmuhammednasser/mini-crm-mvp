@@ -23,7 +23,7 @@ function Write-Info  { param([string]$msg) Write-Host "     $msg" -ForegroundCol
 function Convert-SshToHttps {
     param([string]$sshUrl)
     # Extract  owner/repo  from  git@github.com:owner/repo[.git]
-    if ($sshUrl -match '^git@github\.com:([A-Za-z0-9_.\-]+/[A-Za-z0-9_.\-]+?)(?\.git)?$') {
+    if ($sshUrl -match '^git@github\.com:([A-Za-z0-9_.\-]+/[A-Za-z0-9_.\-]+?)(?:\.git)?$') {
         return "https://github.com/$($Matches[1]).git"
     }
     throw "Cannot convert '$sshUrl' — not a recognised SSH GitHub URL."
