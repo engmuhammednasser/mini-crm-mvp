@@ -2,7 +2,7 @@
 #  github-upload.ps1
 #  A reusable helper script to upload any project to GitHub easily and safely.
 #  Author : Antigravity AI Assistant
-#  Date   : 2026-05-02  |  v2.0
+#  Date   : 2026-05-02  |  v2.1
 # =============================================================================
 
 # ── Pretty helpers ─────────────────────────────────────────────────────────────
@@ -11,6 +11,39 @@ function Write-OK    { param([string]$msg) Write-Host "  ✔  $msg" -ForegroundC
 function Write-Warn  { param([string]$msg) Write-Host "  ⚠  $msg" -ForegroundColor Yellow }
 function Write-Fail  { param([string]$msg) Write-Host "`n  ✖  $msg" -ForegroundColor Red }
 function Write-Info  { param([string]$msg) Write-Host "     $msg" -ForegroundColor Gray }
+
+# =============================================================================
+# Convert-SshToHttps
+# ──────────────────
+# Converts a GitHub SSH URL to its HTTPS equivalent.
+# Used when the user wants to fall back from SSH to HTTPS+PAT authentication.
+#
+#   git@github.com:owner/repo.git  →  https://github.com/owner/repo.git
+# =============================================================================
+function Convert-SshToHttps {
+    param([string]$sshUrl)
+    # Extract  owner/repo  from  git@github.com:owner/repo[.git]
+    if ($sshUrl -match '^git@github\.com:([A-Za-z0-9_.\-]+/[A-Za-z0-9_.\-]+?)(?\.git)?$') {
+        return "https://github.com/$($Matches[1]).git"
+    }
+    throw "Cannot convert '$sshUrl' — not a recognised SSH GitHub URL."
+}
+
+# =============================================================================
+# Test-SshGitHubAccess
+# ────────────────────
+# Returns $true when the local machine has a working SSH key registered with
+# GitHub.  Runs `ssh -T git@github.com` with a 10-second timeout.
+# =============================================================================
+function Test-SshGitHubAccess {
+    try {
+        $result = & ssh -T git@github.com -o ConnectTimeout=10 -o BatchMode=yes 2>&1
+        # GitHub returns exit code 1 even on success, so check stdout/stderr text
+        return ($result -match 'successfully authenticated')
+    } catch {
+        return $false
+    }
+}
 
 # =============================================================================
 # URL NORMALIZATION FUNCTIONS
@@ -476,21 +509,89 @@ git branch -M $branch 2>&1 | Out-Null
 Write-OK "Branch set."
 
 # =============================================================================
-# STEP 14 – Push to GitHub
+# STEP 14 – Push to GitHub  (SSH-aware, with HTTPS fallback offer)
 # =============================================================================
 Write-Step "Pushing to GitHub…"
-Write-Warn "(You may be prompted for your GitHub credentials.)"
-Write-Info  "Tip: Use a Personal Access Token as your password."
-Write-Host ""
 
+# ── Detect SSH vs HTTPS and handle authentication proactively ──────────────
+$isSSH = $repoUrl -match '^git@'
+
+if ($isSSH) {
+    Write-Info "Protocol: SSH (git@github.com)"
+    Write-Info "Checking if your SSH key is registered with GitHub…"
+
+    $sshOk = Test-SshGitHubAccess
+
+    if (-not $sshOk) {
+        Write-Host ""
+        Write-Warn "SSH authentication test failed!"
+        Write-Info  "Your local SSH key is either missing or not added to your GitHub account."
+        Write-Host ""
+        Write-Host "  You have two options:" -ForegroundColor Cyan
+        Write-Host "  [1] Switch to HTTPS + Personal Access Token (recommended — no SSH setup needed)" -ForegroundColor White
+        Write-Host "  [2] Continue with SSH anyway (if you know your key is set up)" -ForegroundColor White
+        Write-Host ""
+        Write-Host "  How to set up SSH keys:" -ForegroundColor DarkGray
+        Write-Host "    https://docs.github.com/en/authentication/connecting-to-github-with-ssh" -ForegroundColor DarkGray
+        Write-Host ""
+
+        $authChoice = Read-Host "  Enter 1 or 2"
+
+        if ($authChoice -eq '1') {
+            # ── Convert SSH → HTTPS and update remote ────────────────────────
+            try {
+                $httpsUrl = Convert-SshToHttps $repoUrl
+                $repoUrl  = $httpsUrl
+                git remote set-url origin $repoUrl | Out-Null
+                Write-OK  "Remote switched to HTTPS: $repoUrl"
+                $isSSH = $false
+            } catch {
+                Write-Fail "Could not convert URL: $($_.Exception.Message)"
+                exit 1
+            }
+        } else {
+            Write-Warn "Continuing with SSH. Push may fail if your key is not configured."
+        }
+    } else {
+        Write-OK "SSH key verified — GitHub access confirmed."
+    }
+}
+
+if (-not $isSSH) {
+    Write-Info "Protocol: HTTPS"
+    Write-Warn "When prompted for a password, enter your Personal Access Token (PAT) — NOT your GitHub password."
+    Write-Host ""
+    Write-Host "  How to create a PAT:" -ForegroundColor DarkGray
+    Write-Host "    GitHub → Settings → Developer settings → Personal access tokens → Tokens (classic)" -ForegroundColor DarkGray
+    Write-Host "    Required scope: repo (Full control of private repositories)" -ForegroundColor DarkGray
+    Write-Host ""
+}
+
+Write-Host ""
 git push -u origin $branch
 
 if ($LASTEXITCODE -ne 0) {
     Write-Host ""
-    Write-Fail "Push failed. Common causes:"
-    Write-Info  "  • Wrong repository URL"
-    Write-Info  "  • Authentication error (use a Personal Access Token, not your password)"
-    Write-Info  "  • Remote branch has commits not in your local history → try git pull first"
+    Write-Fail "Push failed."
+    Write-Host ""
+
+    if ($isSSH) {
+        Write-Host "  SSH troubleshooting:" -ForegroundColor Yellow
+        Write-Info  "  1. Generate a key:   ssh-keygen -t ed25519 -C \"your@email.com\""
+        Write-Info  "  2. Add to agent:     ssh-add ~/.ssh/id_ed25519"
+        Write-Info  "  3. Copy public key:  Get-Content ~/.ssh/id_ed25519.pub | Set-Clipboard"
+        Write-Info  "  4. Add to GitHub:    https://github.com/settings/ssh/new"
+        Write-Info  "  5. Test connection:  ssh -T git@github.com"
+        Write-Info  "  Or run this script again and choose HTTPS (option 1) instead."
+    } else {
+        Write-Host "  HTTPS troubleshooting:" -ForegroundColor Yellow
+        Write-Info  "  • Do NOT use your GitHub account password — it no longer works for Git."
+        Write-Info  "  • Use a Personal Access Token (PAT) as the password."
+        Write-Info  "  • Create a PAT at: https://github.com/settings/tokens"
+        Write-Info  "  • Required scope: repo"
+        Write-Info  "  • If prompted, enter your GitHub USERNAME (not email) and PAT as password."
+        Write-Info  "  • The remote has uncommitted history → run: git pull --rebase origin $branch"
+    }
     exit 1
 }
 
