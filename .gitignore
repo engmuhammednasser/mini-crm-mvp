@@ -1,0 +1,63 @@
+*.log
+.DS_Store
+.env
+.env.backup
+.env.production
+.phpactor.json
+.phpunit.result.cache
+/.codex
+/.cursor/
+/.idea
+/.nova
+/.phpunit.cache
+/.vscode
+/.zed
+/auth.json
+/node_modules
+/public/build
+/public/hot
+/public/storage
+/storage/*.key
+/storage/pail
+/vendor
+_ide_helper.php
+Homestead.json
+Homestead.yaml
+Thumbs.db
+
+# -- Added by github-upload.ps1 ------------------------------------------
+# -- Environment & secrets -----------------------------------------------
+.env.*
+!.env.example
+
+# -- WordPress -----------------------------------------------------------
+wp-config.php
+
+# -- PHP / Composer ------------------------------------------------------
+vendor/
+
+# -- Node / npm ----------------------------------------------------------
+node_modules/
+
+# -- Logs ----------------------------------------------------------------
+logs/
+
+# -- Storage / cache (Laravel, Symfony, etc.) ----------------------------
+storage/framework/cache/
+storage/framework/sessions/
+storage/framework/views/
+storage/logs/
+bootstrap/cache/
+
+# -- IDE & editor files --------------------------------------------------
+.idea/
+.vscode/
+*.suo
+*.user
+*.swp
+*.swo
+*.sublime-workspace
+*.sublime-project
+
+# -- OS generated files --------------------------------------------------
+Desktop.ini
